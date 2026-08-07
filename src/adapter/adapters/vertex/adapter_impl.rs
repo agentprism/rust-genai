@@ -178,13 +178,18 @@ impl Adapter for VertexAdapter {
 		model_iden: ModelIden,
 		reqwest_builder: RequestBuilder,
 		options_set: ChatOptionsSet<'_, '_>,
+		response_observer: Option<crate::client::BoundResponseObserver>,
 	) -> Result<ChatStreamResponse> {
 		let (_, model_name) = model_iden.model_name.namespace_and_name();
 		let publisher = VertexPublisher::from_model_name(model_name)?;
 
 		match publisher {
-			VertexPublisher::Google => GeminiAdapter::to_chat_stream(model_iden, reqwest_builder, options_set),
-			VertexPublisher::Anthropic => AnthropicAdapter::to_chat_stream(model_iden, reqwest_builder, options_set),
+			VertexPublisher::Google => {
+				GeminiAdapter::to_chat_stream(model_iden, reqwest_builder, options_set, response_observer)
+			}
+			VertexPublisher::Anthropic => {
+				AnthropicAdapter::to_chat_stream(model_iden, reqwest_builder, options_set, response_observer)
+			}
 		}
 	}
 
@@ -251,7 +256,7 @@ impl VertexAdapter {
 			system,
 			messages,
 			tools,
-		} = AnthropicAdapter::into_anthropic_request_parts(chat_req, options_set.cache_control().cloned())?;
+		} = AnthropicAdapter::into_anthropic_request_parts(&model, chat_req, options_set.cache_control().cloned())?;
 
 		// Vertex Anthropic: model is in URL, not body; anthropic_version goes in body
 		let stream = matches!(service_type, ServiceType::ChatStream);

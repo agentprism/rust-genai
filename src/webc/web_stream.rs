@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::client::BoundResponseObserver;
 use crate::error::{BoxError, Error as GenaiError};
 
 /// WebStream is a simple web stream implementation that splits the stream messages by a given delimiter.
@@ -28,6 +29,9 @@ pub struct WebStream {
 	// When a multi-byte character is split across TCP/HTTP chunk boundaries,
 	// the trailing bytes are carried over to be prepended to the next chunk.
 	utf8_carry: Vec<u8>,
+	// Optional response observer exec hook, fired once when the lazy send resolves —
+	// on the response head, before the status check and before the body is consumed.
+	response_observer: Option<BoundResponseObserver>,
 }
 
 pub enum StreamMode {
@@ -49,6 +53,7 @@ impl WebStream {
 			partial_message: None,
 			remaining_messages: None,
 			utf8_carry: Vec::new(),
+			response_observer: None,
 		}
 	}
 
@@ -61,7 +66,14 @@ impl WebStream {
 			partial_message: None,
 			remaining_messages: None,
 			utf8_carry: Vec::new(),
+			response_observer: None,
 		}
+	}
+
+	/// Sets the (optional) response observer exec hook to fire on the response head.
+	pub fn with_response_observer(mut self, response_observer: Option<BoundResponseObserver>) -> Self {
+		self.response_observer = response_observer;
+		self
 	}
 }
 
@@ -90,6 +102,9 @@ impl Stream for WebStream {
 							// For error responses, we need to read the body to get the error message
 							// Store a future that reads the body and returns an error
 							let error_future = async move {
+								// Capture the headers while the response is still in hand
+								// (e.g., `retry-after`, `retry-after-ms`, `x-should-retry` for retry layers)
+								let headers = response.headers().clone();
 								let body = response
 									.text()
 									.await
@@ -98,6 +113,7 @@ impl Stream for WebStream {
 									status,
 									canonical_reason: status.canonical_reason().unwrap_or("Unknown").to_string(),
 									body,
+									headers: Box::new(headers),
 								}))
 							};
 							this.response_future = Some(Box::pin(error_future));
@@ -192,7 +208,17 @@ impl Stream for WebStream {
 			}
 
 			if let Some(reqwest_builder) = this.reqwest_builder.take() {
-				let fut = async move { reqwest_builder.send().await.map_err(|e| Box::new(e) as BoxError) };
+				let response_observer = this.response_observer.take();
+				let fut = async move {
+					let response = reqwest_builder.send().await.map_err(|e| Box::new(e) as BoxError)?;
+					// Fire the response observer as soon as the response head is in hand —
+					// before the status check above and before the body is consumed —
+					// so it also fires on 4xx/5xx responses.
+					if let Some(observer) = response_observer {
+						observer.observe(response.status(), response.headers().clone()).await;
+					}
+					Ok(response)
+				};
 				this.response_future = Some(Box::pin(fut));
 				continue;
 			}
@@ -264,3 +290,11 @@ fn process_buff_string_delimited(
 		candidate_message,
 	})
 }
+
+// region:    --- Tests
+
+#[cfg(test)]
+#[path = "web_stream_tests.rs"]
+mod tests;
+
+// endregion: --- Tests

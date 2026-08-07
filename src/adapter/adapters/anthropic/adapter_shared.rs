@@ -2,12 +2,12 @@ use super::AnthropicAdapter;
 use super::ant_model::{AnthropicMaxTokens, AnthropicModel, AnthropicModelCapabilities};
 use crate::Result;
 use crate::adapter::adapters::anthropic::ant_reasoning::insert_anthropic_reasoning;
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{assistant_embedded_tool_response_err, get_api_key};
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, CacheControl, CacheCreationDetails, ChatOptionsSet, ChatRequest, ChatResponse,
 	ChatResponseFormat, ChatRole, ContentPart, JsonSchemaDialect, MessageContent, PromptTokensDetails, ReasoningEffort,
-	StopReason, Tool, ToolCall, ToolChoice, ToolConfig, ToolName, Usage, sanitize_json_schema,
+	StopReason, Tool, ToolCall, ToolChoice, ToolConfig, ToolName, ToolResponse, Usage, sanitize_json_schema,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{WebClient, WebResponse};
@@ -108,6 +108,7 @@ impl AnthropicAdapter {
 	/// Takes the GenAI ChatMessages and constructs the System string and JSON Messages for Anthropic.
 	/// - Will push the `ChatRequest.system` and system message to `AnthropicRequestParts.system`
 	pub(in crate::adapter::adapters) fn into_anthropic_request_parts(
+		model_iden: &ModelIden,
 		mut chat_req: ChatRequest,
 		request_cache_control: Option<CacheControl>,
 	) -> Result<AnthropicRequestParts> {
@@ -183,11 +184,14 @@ impl AnthropicAdapter {
 
 									if is_image {
 										match &source {
-											BinarySource::Url(_) => {
-												// As of this API version, Anthropic doesn't support images by URL directly in messages.
-												warn!(
-													"Anthropic doesn't support images from URL, need to handle it gracefully"
-												);
+											BinarySource::Url(url) => {
+												values.push(json!({
+													"type": "image",
+													"source": {
+														"type": "url",
+														"url": url,
+													}
+												}));
 											}
 											BinarySource::Base64(content) => {
 												values.push(json!({
@@ -227,11 +231,7 @@ impl AnthropicAdapter {
 								// ToolCall is not valid in user content for Anthropic; skip gracefully.
 								ContentPart::ToolCall(_tc) => {}
 								ContentPart::ToolResponse(tool_response) => {
-									values.push(json!({
-										"type": "tool_result",
-										"content": tool_response.content,
-										"tool_use_id": tool_response.call_id,
-									}));
+									values.push(tool_response_to_tool_result(tool_response));
 								}
 								ContentPart::ThoughtSignature(_) => {}
 								ContentPart::ReasoningContent(_) => {}
@@ -275,7 +275,12 @@ impl AnthropicAdapter {
 							}
 							// Unsupported for assistant role in Anthropic message content
 							ContentPart::Binary(_) => {}
-							ContentPart::ToolResponse(_) => {}
+							// No provider wire represents a tool result authored by the
+							// assistant; fail loudly instead of silently dropping the
+							// content (use a Tool-role message).
+							ContentPart::ToolResponse(_) => {
+								return Err(assistant_embedded_tool_response_err(model_iden));
+							}
 							ContentPart::ThoughtSignature(_) => {}
 							ContentPart::ReasoningContent(_) => {}
 							ContentPart::Custom(custom_part) => values.push(custom_part.data),
@@ -304,11 +309,7 @@ impl AnthropicAdapter {
 					for part in msg.content {
 						match part {
 							ContentPart::ToolResponse(tool_response) => {
-								values.push(json!({
-									"type": "tool_result",
-									"content": tool_response.content,
-									"tool_use_id": tool_response.call_id,
-								}));
+								values.push(tool_response_to_tool_result(tool_response));
 							}
 							ContentPart::Custom(custom_part) => values.push(custom_part.data),
 							_ => {}
@@ -420,7 +421,7 @@ impl AnthropicAdapter {
 			system,
 			messages,
 			tools,
-		} = Self::into_anthropic_request_parts(chat_req, options_set.cache_control().cloned())?;
+		} = Self::into_anthropic_request_parts(&model, chat_req, options_set.cache_control().cloned())?;
 
 		// -- Extract Model Name and Reasoning
 		let (_, raw_model_name) = model.model_name.namespace_and_name();
@@ -807,6 +808,88 @@ fn apply_cache_control_to_parts(cache_control: Option<&CacheControl>, parts: Vec
 		}
 	}
 	parts
+}
+
+/// Serialize a `ToolResponse` into an Anthropic `tool_result` content item.
+///
+/// - Without binary parts, `content` remains a plain string (legacy shape, unchanged).
+/// - With parts, `content` becomes an array of a `text` block (when the text is non-empty)
+///   followed by `image` blocks for image parts (native `base64` or `url` source).
+///
+/// NOTE: Anthropic `tool_result` content only accepts `text` and `image` blocks,
+///       so non-image parts are skipped with a warning. Image sources serialize
+///       the same way as in user-message image handling above.
+fn tool_response_to_tool_result(tool_response: ToolResponse) -> Value {
+	let ToolResponse {
+		call_id,
+		content,
+		parts,
+		..
+	} = tool_response;
+
+	let parts = parts.unwrap_or_default();
+
+	if parts.is_empty() {
+		return json!({
+			"type": "tool_result",
+			"content": content,
+			"tool_use_id": call_id,
+		});
+	}
+
+	let mut values: Vec<Value> = Vec::new();
+	if !content.is_empty() {
+		values.push(json!({"type": "text", "text": content}));
+	}
+
+	for binary in parts {
+		if !binary.is_image() {
+			warn!(
+				"Anthropic tool_result only supports text and image blocks; skipping non-image part '{}'",
+				binary.content_type
+			);
+			continue;
+		}
+		let Binary {
+			content_type, source, ..
+		} = binary;
+		match source {
+			BinarySource::Base64(data) => {
+				values.push(json!({
+					"type": "image",
+					"source": {
+						"type": "base64",
+						"media_type": content_type,
+						"data": data,
+					}
+				}));
+			}
+			BinarySource::Url(url) => {
+				values.push(json!({
+					"type": "image",
+					"source": {
+						"type": "url",
+						"url": url,
+					}
+				}));
+			}
+		}
+	}
+
+	// If all parts were skipped and there is no text, fall back to the legacy string shape.
+	if values.is_empty() {
+		return json!({
+			"type": "tool_result",
+			"content": content,
+			"tool_use_id": call_id,
+		});
+	}
+
+	json!({
+		"type": "tool_result",
+		"content": values,
+		"tool_use_id": call_id,
+	})
 }
 
 fn anthropic_tool_choice(tool_choice: Option<&ToolChoice>) -> Option<Value> {

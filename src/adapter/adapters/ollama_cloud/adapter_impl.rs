@@ -56,7 +56,7 @@ impl Adapter for OllamaCloudAdapter {
 		} = target;
 		let api_key = get_api_key(auth, &model)?;
 		let url = OllamaAdapter::get_service_url(&model, service_type, endpoint)?;
-		let OllamaRequestParts { messages, tools } = OllamaAdapter::into_ollama_request_parts(chat_req)?;
+		let OllamaRequestParts { messages, tools } = OllamaAdapter::into_ollama_request_parts(&model, chat_req)?;
 
 		let mut options = json!({});
 		if let Some(temperature) = chat_options.temperature() {
@@ -122,8 +122,9 @@ impl Adapter for OllamaCloudAdapter {
 		model_iden: ModelIden,
 		reqwest_builder: RequestBuilder,
 		options_set: ChatOptionsSet<'_, '_>,
+		response_observer: Option<crate::client::BoundResponseObserver>,
 	) -> Result<ChatStreamResponse> {
-		OllamaAdapter::to_chat_stream(model_iden, reqwest_builder, options_set)
+		OllamaAdapter::to_chat_stream(model_iden, reqwest_builder, options_set, response_observer)
 	}
 
 	fn to_embed_request_data(

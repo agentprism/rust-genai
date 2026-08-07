@@ -63,7 +63,7 @@ impl Adapter for OllamaAdapter {
 		let url = Self::get_service_url(&model, service_type, endpoint)?;
 
 		// -- Ollama Request Parts
-		let OllamaRequestParts { messages, tools } = Self::into_ollama_request_parts(chat_req)?;
+		let OllamaRequestParts { messages, tools } = Self::into_ollama_request_parts(&model, chat_req)?;
 
 		// -- Ollama Options
 		let mut options = json!({});
@@ -188,9 +188,10 @@ impl Adapter for OllamaAdapter {
 		model_iden: ModelIden,
 		reqwest_builder: RequestBuilder,
 		options_set: ChatOptionsSet<'_, '_>,
+		response_observer: Option<crate::client::BoundResponseObserver>,
 	) -> Result<ChatStreamResponse> {
 		let streamer = OllamaStreamer::new(
-			crate::webc::WebStream::new_with_delimiter(reqwest_builder, "\n"),
+			crate::webc::WebStream::new_with_delimiter(reqwest_builder, "\n").with_response_observer(response_observer),
 			model_iden.clone(),
 			options_set,
 		);
